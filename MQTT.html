@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MQTT 多主題動態圖表＋情境感知</title>
+  <script src="https://unpkg.com/mqtt/dist/mqtt.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.7.0/dist/tf.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f4f4f4; padding: 20px; }
+    .controls { max-width: 1000px; margin: 0 auto 20px; display: flex; gap: 12px; align-items: flex-end; }
+    .controls input { flex: 1; padding: 8px; border: 1px solid #ccc; border-radius: 4px; }
+    .controls button { padding: 8px 16px; background: #0078d4; color: #fff; border: none; border-radius: 4px; cursor: pointer; }
+    .charts { max-width: 1000px; margin: 0 auto; display: grid; gap: 20px; grid-template-columns: 1fr; }
+    @media(min-width: 768px) { .charts { grid-template-columns: repeat(2,1fr); } }
+    .chart-card {
+      background: #fff; padding: 16px; border-radius: 8px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.1); display: flex; flex-direction: column;
+      position: relative;
+    }
+    .chart-card h3 { margin-bottom: 8px; font-size: 1.2rem; }
+    .context-label { margin-top: 8px; font-weight: bold; text-align: right; }
+    .delete-btn {
+      position: absolute; top: 8px; right: 8px;
+      background: transparent; border: none; font-size: 1.2rem;
+      line-height: 1; cursor: pointer; color: #999;
+    }
+    .delete-btn:hover { color: #f00; }
+    .chart-container { position: relative; flex: 1; }
+    .chart-container canvas { width: 100% !important; height: 250px !important; }
+    .status { margin-left: auto; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <input type="text" id="broker" placeholder="ws://broker-url:port">
+    <input type="text" id="topicInput" placeholder="輸入訂閱 Topic">
+    <button id="btnAddTopic">新增訂閱</button>
+    <div id="status" class="status">狀態: 未連線</div>
+  </div>
+
+  <div class="charts" id="charts"></div>
+
+  <script>
+    const displayCount   = 10;
+    const bufferMax      = 20;
+    const VERIFY_TIMEOUT = 5000;  // ms
+    const charts         = {}, buffers = {}, subscriptions = [];
+    const contextLabels  = {};      // 存放每張卡的情境 <div>
+    let client = null, contextModel = null;
+
+    // 載入 TF.js 情境感知模型
+    tf.ready().then(async () => {
+      try {
+        contextModel = await tf.loadLayersModel('./model/model.json');
+        console.log('情境感知模型載入完成');
+      } catch (e) {
+        console.error('模型載入失敗', e);
+      }
+    });
+
+    function computeThi(T, RH) {
+      return ((1.8*T + 32) - (0.55 - 0.0055*RH)*(1.8*T - 26));
+    }
+
+    // LocalStorage keys & 還原
+    const KEY_BROKER        = 'mqttCharts.broker';
+    const KEY_SUBS          = 'mqttCharts.subscriptions';
+    const KEY_BUFFERS       = 'mqttCharts.buffers';
+    const savedBroker       = localStorage.getItem(KEY_BROKER) || '';
+    const savedSubscriptions= JSON.parse(localStorage.getItem(KEY_SUBS)    || '[]');
+    const savedBuffers      = JSON.parse(localStorage.getItem(KEY_BUFFERS) || '{}');
+
+    // 建立/重連 MQTT client
+    function ensureClient() {
+      if (client) return;
+      const broker = document.getElementById('broker').value.trim();
+      if (!/^wss?:\/\//.test(broker)) {
+        document.getElementById('status').textContent = '狀態: Broker URL 無效';
+        return;
+      }
+      localStorage.setItem(KEY_BROKER, broker);
+      client = mqtt.connect(broker, { reconnectPeriod: 1000 });
+      client.on('connect',   () => {
+        document.getElementById('status').textContent = '狀態: 已連線';
+        subscriptions.forEach(t => client.subscribe(t));
+      });
+      client.on('reconnect', () => document.getElementById('status').textContent = '狀態: 重新連線中...');
+      client.on('close',     () => document.getElementById('status').textContent = '狀態: 已斷線');
+      client.on('error', err  => document.getElementById('status').textContent = 'Error: ' + err.message);
+      client.on('message',   (t,m) => handleMessage(t,m));
+    }
+
+    // 驗證 topic 並新增
+    function verifyAndAddChart(topic) {
+      ensureClient();
+      client.subscribe(topic, (err, granted) => {
+        if (err || !granted.length || granted[0].qos === 128) {
+          return alert(`訂閱失敗："${topic}" 無權限或不存在`);
+        }
+        let timer = setTimeout(() => {
+          client.removeListener('message', onMsg);
+          client.unsubscribe(topic);
+          alert(`5 秒內未收到 "${topic}" 訊息，已取消新增`);
+        }, VERIFY_TIMEOUT);
+        function onMsg(t, msg) {
+          if (t !== topic) return;
+          clearTimeout(timer);
+          client.removeListener('message', onMsg);
+          createChart(topic);
+          handleMessage(topic, msg);
+        }
+        client.on('message', onMsg);
+      });
+    }
+
+    // 建立卡片＋Chart.js＋情境<div>
+    function createChart(topic) {
+      if (charts[topic]) return;
+      const card = document.createElement('div');
+      card.className = 'chart-card';
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'delete-btn';
+      delBtn.textContent = '×';
+      delBtn.title = '刪除圖表';
+      delBtn.onclick = () => {
+        client.unsubscribe(topic);
+        charts[topic].destroy();
+        delete charts[topic];
+        delete buffers[topic];
+        delete contextLabels[topic];
+        const i = subscriptions.indexOf(topic);
+        if (i > -1) subscriptions.splice(i,1);
+        saveState();
+        card.remove();
+      };
+
+      const title = document.createElement('h3');
+      title.textContent = `主題：${topic}`;
+
+      const ctxLabel = document.createElement('div');
+      ctxLabel.className = 'context-label';
+      ctxLabel.textContent = '情境：──';
+      contextLabels[topic] = ctxLabel;
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'chart-container';
+      const canvas = document.createElement('canvas');
+      wrapper.appendChild(canvas);
+
+      card.append(delBtn, title, ctxLabel, wrapper);
+      document.getElementById('charts').appendChild(card);
+
+      buffers[topic] = savedBuffers[topic] || { labels:[], temp:[], hum:[], thi:[] };
+      const ctx = canvas.getContext('2d');
+      charts[topic] = new Chart(ctx, {
+        type:'line',
+        data: {
+          labels:[],
+          datasets:[
+            { label:'溫度 (°C)', data:[], tension:0.1 },
+            { label:'濕度 (%)', data:[], tension:0.1 },
+            { label:'THI', data:[], tension:0.1 }
+          ]
+        },
+        options:{ responsive:true, maintainAspectRatio:false }
+      });
+
+      // 還原舊資料
+      const buf = buffers[topic];
+      if (buf.labels.length) {
+        const start = Math.max(buf.labels.length - displayCount, 0);
+        charts[topic].data.labels = buf.labels.slice(start);
+        charts[topic].data.datasets[0].data = buf.temp.slice(start);
+        charts[topic].data.datasets[1].data = buf.hum.slice(start);
+        charts[topic].data.datasets[2].data = buf.thi.slice(start);
+        charts[topic].update();
+      }
+
+      subscriptions.push(topic);
+      saveState();
+    }
+
+    // 處理訊息＋更新圖表＋情境感知
+    async function handleMessage(topic, msg) {
+      if (!buffers[topic] || !charts[topic]) return;
+      let p;
+      try { p = JSON.parse(msg.toString()); }
+      catch { return; }
+
+      const T   = Number(p.temperature ?? p.Temp);
+      const H   = Number(p.humidity    ?? p.Humi);
+      const thi = Number(p.thi ?? computeThi(T,H));
+      const now = new Date(p.timestamp||Date.now()).toLocaleTimeString();
+
+      // 更新緩衝
+      const buf = buffers[topic];
+      buf.labels.push(now);
+      buf.temp.push(T);
+      buf.hum.push(H);
+      buf.thi.push(thi);
+      if (buf.labels.length > bufferMax) {
+        buf.labels.shift(); buf.temp.shift();
+        buf.hum.shift();  buf.thi.shift();
+      }
+      saveState();
+
+      // 更新 Chart
+      const chart = charts[topic];
+      const start = Math.max(buf.labels.length - displayCount, 0);
+      chart.data.labels = buf.labels.slice(start);
+      chart.data.datasets[0].data = buf.temp.slice(start);
+      chart.data.datasets[1].data = buf.hum.slice(start);
+      chart.data.datasets[2].data = buf.thi.slice(start);
+      chart.update();
+
+      // 情境感知判斷
+      let state = '──';
+      if (contextModel) {
+        try {
+          const input  = tf.tensor2d([[T,H,thi]]);
+          const output = contextModel.predict(input);
+          const scores = await output.data();
+          input.dispose(); output.dispose();
+          const labels = ['舒適','警示','危險'];
+          state = labels[scores.indexOf(Math.max(...scores))];
+        } catch (e) {
+          console.warn('模型推論失敗，改用規則', e);
+        }
+      }
+      if (state==='──') {
+        if (thi < 75)      state = '舒適';
+        else if (thi < 82) state = '警示';
+        else               state = '危險';
+      }
+      contextLabels[topic].textContent = `情境：${state}`;
+    }
+
+    function saveState() {
+      localStorage.setItem(KEY_SUBS,    JSON.stringify(subscriptions));
+      localStorage.setItem(KEY_BUFFERS, JSON.stringify(buffers));
+    }
+
+    // 初始化還原
+    document.addEventListener('DOMContentLoaded', () => {
+      document.getElementById('broker').value = savedBroker;
+      if (savedBroker) ensureClient();
+      savedSubscriptions.forEach(t => verifyAndAddChart(t));
+    });
+
+    // 綁定新增按鈕
+    document.getElementById('btnAddTopic').addEventListener('click', () => {
+      const b = document.getElementById('broker').value.trim();
+      if (!b) return alert('請先輸入 Broker URL');
+      const t = document.getElementById('topicInput').value.trim();
+      if (!t) return alert('請輸入 Topic');
+      if (subscriptions.includes(t)) return alert(`主題 "${t}" 已存在`);
+      verifyAndAddChart(t);
+      document.getElementById('topicInput').value = '';
+    });
+  </script>
+</body>
+</html>
